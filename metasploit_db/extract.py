@@ -1,24 +1,14 @@
 # extract_metasploit.py
-import os
 import requests
-from datetime import datetime
 
-def download_raw_json(url, output_dir):
+def download_raw_json_to_text(url: str, timeout: int = 60) -> str:
     """
-    Download the metasploit JSON and save to output_dir/metasploit.json (dated name optional).
-    Returns saved file path.
+    Download remote JSON and return decoded text (no local file).
     """
-    os.makedirs(output_dir, exist_ok=True)
-    # we will save as metasploit.json (not dated) to avoid extra dated files
-    filename = "metasploit.json"
-    save_path = os.path.join(output_dir, filename)
-
-    print(f"⬇️ Downloading JSON from {url} → {save_path}")
-    resp = requests.get(url, stream=True, timeout=60)
+    print(f"⬇️ Downloading JSON from {url}")
+    resp = requests.get(url, stream=True, timeout=timeout)
     resp.raise_for_status()
-    with open(save_path, "wb") as f:
-        for chunk in resp.iter_content(chunk_size=8192):
-            if chunk:
-                f.write(chunk)
-    print("✅ Download complete")
-    return save_path
+    resp.encoding = resp.encoding or "utf-8"
+    text = resp.text
+    print(f"✅ Download complete (size={len(text)} bytes)")
+    return text

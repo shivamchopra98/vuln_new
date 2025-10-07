@@ -1,90 +1,62 @@
 # transform_metasploit.py
 import json
 import re
-import os
 from datetime import datetime
-import pandas as pd
-import csv
+from typing import Tuple, List, Dict
 
-CLEAN_WHITESPACE_RE = re.compile(r"\s+")
+CLEAN_RE = re.compile(r"\s+")
 
-def to_semicolon(value):
-    """Convert lists to semicolon-joined strings, flatten newlines to spaces, clean whitespace."""
+def _clean_text(x):
+    if x is None:
+        return None
+    s = str(x)
+    s = s.replace("\r", " ").replace("\n", " ")
+    s = CLEAN_RE.sub(" ", s).strip()
+    return s if s != "" else None
+
+def _to_semicolon(value):
     if value is None:
         return None
     if isinstance(value, list):
         parts = []
-        for x in value:
-            s = str(x)
-            s = s.replace("\r", " ").replace("\n", " ")
-            s = CLEAN_WHITESPACE_RE.sub(" ", s).strip()
+        for v in value:
+            s = _clean_text(v)
             if s:
                 parts.append(s)
         return ";".join(parts) if parts else None
-    s = str(value)
-    s = s.replace("\r", " ").replace("\n", " ")
-    s = CLEAN_WHITESPACE_RE.sub(" ", s).strip()
-    return s if s != "" else None
+    return _clean_text(value)
 
-def clean_text(value):
-    """Replace newlines, collapse whitespace, trim."""
-    if value is None:
-        return None
-    s = str(value)
-    s = s.replace("\r", " ").replace("\n", " ")
-    s = CLEAN_WHITESPACE_RE.sub(" ", s).strip()
-    return s if s != "" else None
-
-def transform_json(json_path):
+def transform_json_text_to_records_and_json_bytes(json_text: str) -> Tuple[List[Dict], bytes]:
     """
-    Read metasploit modules metadata JSON and write a clean CSV with only these columns:
-    id,name,fullname,aliases,rank,type,author,description,references,platform,autofilter_services,rport,path,ref_name,uploaded_date
-    Returns path to generated CSV.
+    Accept raw metasploit JSON text and return:
+      - list of normalized dict records
+      - bytes of the canonical transformed JSON (utf-8)
     """
-    print(f"🔄 Transforming JSON: {json_path}")
-    with open(json_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
+    print("🔄 Transforming JSON (in memory)...")
+    raw = json.loads(json_text)
 
-    rows = []
-    for module_key, meta in data.items():
-        # Select and clean fields
-        row = {
-            "id": module_key,
-            "name": clean_text(meta.get("name") or ""),
-            "fullname": clean_text(meta.get("fullname") or module_key),
-            "aliases": to_semicolon(meta.get("aliases")),
-            "rank": meta.get("rank"),
-            "type": clean_text(meta.get("type")),
-            "author": to_semicolon(meta.get("author")),
-            "description": clean_text(meta.get("description")),
-            "references": to_semicolon(meta.get("references")),
-            "platform": to_semicolon(meta.get("platform")),
-            "autofilter_services": to_semicolon(meta.get("autofilter_services")),
-            "rport": meta.get("rport"),
-            "path": clean_text(meta.get("path")),
-            "ref_name": clean_text(meta.get("ref_name") or module_key),
+    records = []
+    for module_key, meta in raw.items():
+        rec = {
+            "module_key": module_key,
+            "id": None,  # placeholder for generated META-id (filled in loader)
+            "module_name": _clean_text(meta.get("name") or ""),
+            "fullname": _clean_text(meta.get("fullname") or module_key),
+            "aliases": _to_semicolon(meta.get("aliases")),
+            "rank": _clean_text(meta.get("rank")),
+            "type": _clean_text(meta.get("type")),
+            "author": _to_semicolon(meta.get("author")),
+            "description": _clean_text(meta.get("description")),
+            "references": _to_semicolon(meta.get("references")),
+            "platform": _to_semicolon(meta.get("platform")),
+            "autofilter_services": _to_semicolon(meta.get("autofilter_services")),
+            "rport": _clean_text(meta.get("rport")),
+            "path": _clean_text(meta.get("path")),
+            "ref_name": _clean_text(meta.get("ref_name") or module_key),
+            "uploaded_date": datetime.utcnow().strftime("%Y-%m-%d")
         }
-        rows.append(row)
+        records.append(rec)
 
-    df = pd.DataFrame(rows, columns=[
-        "id","name","fullname","aliases","rank","type","author","description",
-        "references","platform","autofilter_services","rport","path","ref_name"
-    ])
-
-    # Add uploaded_date as today's date
-    today_str = datetime.now().strftime("%Y-%m-%d")
-    df["uploaded_date"] = today_str
-
-    csv_path = os.path.splitext(json_path)[0] + ".csv"
-    # Write CSV ensuring single-line rows
-    df.to_csv(
-        csv_path,
-        index=False,
-        lineterminator="\n",
-        quoting=csv.QUOTE_MINIMAL,
-        escapechar="\\",
-        encoding="utf-8"
-    )
-
-    print(f"✅ CSV written: {csv_path} (rows={len(df)}) — all rows are single-line cleaned entries")
-    return csv_path
+    json_bytes = json.dumps(records, ensure_ascii=False, indent=2).encode("utf-8")
+    print(f"✅ Transformation complete: records={len(records)} (json size={len(json_bytes)} bytes)")
+    return records, json_bytes

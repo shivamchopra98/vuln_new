@@ -1,439 +1,332 @@
-# load.py
+# load_metasploit.py
 import os
 import re
-import math
 import time
+import math
 import json
-import pandas as pd
-import boto3
+import io
+import hashlib
 from decimal import Decimal, InvalidOperation
+from typing import List, Dict
+import boto3
 from botocore.exceptions import ClientError
-from datetime import datetime
 
-# Default config (can be overridden by caller)
+# Config defaults (override via user_cfg)
 DEFAULT_CONFIG = {
     "TABLE_NAME": "metasploit_data",
     "DDB_ENDPOINT": "http://localhost:8000",
     "AWS_REGION": "us-east-1",
-    "PROJECT_ROOT": r"C:\Users\ShivamChopra\Projects\vuln\metasploit_db",
-    "DAILY_DIR": None,  # resolved relative to PROJECT_ROOT if None
-    "BASELINE_FILENAME": "metasploit_baseline.csv",
-    "BATCH_PROGRESS_INTERVAL": 100
+    "S3_BUCKET": None,
+    "S3_PREFIX": "vuln-raw-source/metasploit/",
+    "BASELINE_FILENAME": "metasploit_baseline.json",
+    "CANONICAL_FILENAME": "metasploit.json",
+    "BATCH_PROGRESS_INTERVAL": 100,
+    "AWS_ACCESS_KEY_ID": None,
+    "AWS_SECRET_ACCESS_KEY": None,
 }
 
 META_ID_PREFIX = "META"
+CVE_RE = re.compile(r"(CVE-\d{4}-\d{4,7})", re.IGNORECASE)
 
-# ---------- Helpers ----------
-def _resolve_config(user_config):
+# ---------------- utils ----------------
+def _resolve_config(user_cfg: Dict) -> Dict:
     cfg = DEFAULT_CONFIG.copy()
-    if user_config:
-        cfg.update(user_config)
-    if not cfg["DAILY_DIR"]:
-        cfg["DAILY_DIR"] = os.path.join(cfg["PROJECT_ROOT"], "daily_extract")
-    cfg["BASELINE_FILE"] = os.path.join(cfg["DAILY_DIR"], cfg["BASELINE_FILENAME"])
+    if user_cfg:
+        cfg.update(user_cfg)
+    if cfg["S3_PREFIX"] and not cfg["S3_PREFIX"].endswith("/"):
+        cfg["S3_PREFIX"] = cfg["S3_PREFIX"] + "/"
     return cfg
 
-def ensure_daily_dir(daily_dir):
-    os.makedirs(daily_dir, exist_ok=True)
+def _clean_for_hash(v) -> str:
+    """Canonicalize a field value for hashing: None -> '', collapse whitespace, strip."""
+    if v is None:
+        return ""
+    s = str(v)
+    s = s.replace("\r", " ").replace("\n", " ")
+    # collapse whitespace
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
 
-def connect_dynamodb(cfg):
-    return boto3.resource(
-        "dynamodb",
-        region_name=cfg["AWS_REGION"],
-        aws_access_key_id="dummy",
-        aws_secret_access_key="dummy",
-        endpoint_url=cfg["DDB_ENDPOINT"],
-    )
+def _compute_content_hash_for_record(rec: Dict, canonical_fields: List[str]) -> str:
+    pieces = []
+    for f in canonical_fields:
+        pieces.append(_clean_for_hash(rec.get(f)))
+    data = "|".join(pieces)
+    h = hashlib.sha256(data.encode("utf-8")).hexdigest()
+    return h
 
-def create_table_if_missing(ddb_resource, table_name):
-    existing = ddb_resource.meta.client.list_tables().get("TableNames", [])
-    if table_name not in existing:
-        print(f"⚡ Creating DynamoDB table '{table_name}' locally...")
-        table = ddb_resource.create_table(
-            TableName=table_name,
-            KeySchema=[{"AttributeName": "id", "KeyType": "HASH"}],
-            AttributeDefinitions=[{"AttributeName": "id", "AttributeType": "S"}],
-            ProvisionedThroughput={"ReadCapacityUnits": 5, "WriteCapacityUnits": 5},
-        )
-        table.meta.client.get_waiter("table_exists").wait(TableName=table_name)
-        print("✅ Table created.")
-    return ddb_resource.Table(table_name)
+def _extract_cve(refs):
+    if not refs:
+        return None
+    m = CVE_RE.search(str(refs))
+    return m.group(1).upper() if m else None
 
-def normalize_value(v):
-    """Normalize values for stable comparison; ignore uploaded_date in comparisons."""
+def _normalize_for_ddb(v):
+    """Convert values to types safe for DynamoDB (Decimal for numbers)."""
     if v is None:
         return None
-    try:
-        if pd.isna(v):
-            return None
-    except Exception:
-        pass
-    if isinstance(v, Decimal):
-        return str(v)
+    # handle floats / numeric strings
+    # first handle float type
     if isinstance(v, float):
         if math.isnan(v) or math.isinf(v):
             return None
-        s = str(v)
-        return s[:-2] if s.endswith(".0") else s
-    s = str(v).strip()
-    if s == "" or s.lower() in {"nan", "none"}:
-        return None
-    return s
-
-def normalize_row_for_compare(d):
-    return {k: normalize_value(v) for k, v in d.items() if k != "uploaded_date"}
-
-def rows_differ(csv_row_dict, ddb_item_dict):
-    return normalize_row_for_compare(csv_row_dict) != normalize_row_for_compare(ddb_item_dict)
-
-def remove_dated_csvs_keep_baseline(daily_dir, baseline_file):
-    """
-    Remove dated CSV files in daily_dir except baseline_file.
-    Also remove stray CSVs not equal to baseline (defensive).
-    """
-    baseline_name = os.path.basename(baseline_file)
-    pattern = re.compile(r"^\d{4}-\d{2}-\d{2}\.csv$")
+        try:
+            return Decimal(str(v))
+        except Exception:
+            return str(v)
+    # if already Decimal
+    if isinstance(v, Decimal):
+        return v
+    # strings: check numeric-looking
+    if isinstance(v, str):
+        s = v.strip()
+        if s == "" or s.lower() in {"none", "nan"}:
+            return None
+        if re.fullmatch(r"-?\d+(\.\d+)?", s):
+            try:
+                return Decimal(s)
+            except Exception:
+                return s
+        return s
+    # other types -> string fallback
     try:
-        for fname in os.listdir(daily_dir):
-            if fname == baseline_name:
-                continue
-            full = os.path.join(daily_dir, fname)
-            if pattern.match(fname) and fname.endswith(".csv"):
-                try:
-                    os.remove(full)
-                    print(f"🗑️ Deleted dated CSV: {full}")
-                except Exception as e:
-                    print(f"⚠️ Failed to delete {full}: {e}")
-            elif fname.endswith(".csv"):
-                try:
-                    os.remove(full)
-                    print(f"🗑️ Deleted stray CSV: {full}")
-                except Exception as e:
-                    print(f"⚠️ Failed to delete stray CSV {full}: {e}")
-    except Exception as e:
-        print(f"⚠️ Error while cleaning dated CSVs: {e}")
+        return str(v)
+    except Exception:
+        return None
 
-# meta id parsing/generation helpers
-def parse_meta_id(meta_id):
-    """
-    Parse id like META-2025-000123 -> returns (year:int, seq:int) or (None,None)
-    """
-    if not meta_id:
-        return None, None
-    m = re.match(rf"^{META_ID_PREFIX}-(\d{{4}})-0*(\d+)$", str(meta_id))
-    if not m:
-        return None, None
-    year = int(m.group(1))
-    seq = int(m.group(2))
-    return year, seq
+# ---------------- S3 helpers ----------------
+def _s3_put_bytes(s3_client, bucket: str, key: str, data: bytes):
+    s3_client.put_object(Bucket=bucket, Key=key, Body=data)
 
-def next_meta_id_for_year(existing_ids_set, year):
+def _s3_get_text_if_exists(s3_client, bucket: str, key: str):
+    try:
+        res = s3_client.get_object(Bucket=bucket, Key=key)
+        return res["Body"].read().decode("utf-8")
+    except ClientError as e:
+        code = e.response.get("Error", {}).get("Code", "")
+        if code in ("NoSuchKey", "404", "NoSuchBucket", "NoSuchKey"):
+            return None
+        raise
+
+# ---------------- meta-id helpers ----------------
+def _next_meta_id_for_year(existing_ids_set, year: int) -> str:
     max_seq = 0
     for mid in existing_ids_set:
-        y, seq = parse_meta_id(mid)
-        if y == year and seq is not None:
-            if seq > max_seq:
-                max_seq = seq
-    next_seq = max_seq + 1
-    return f"{META_ID_PREFIX}-{year}-{str(next_seq).zfill(6)}"
-
-def extract_year_from_mod_time(mod_time_str):
-    """
-    Try to parse year from mod_time string like '2025-05-21 08:32:40 +0000'.
-    Returns integer year if possible, otherwise None.
-    """
-    if not mod_time_str:
-        return None
-    s = str(mod_time_str).strip()
-    # common pattern: starts with YYYY-
-    m = re.match(r"^(\d{4})[-/]", s)
-    if m:
+        m = re.match(rf"^{META_ID_PREFIX}-(\d{{4}})-0*(\d+)$", str(mid))
+        if not m:
+            continue
         try:
-            return int(m.group(1))
-        except Exception:
-            pass
-    # fallback: try to parse datetime
-    for fmt in ("%Y-%m-%d %H:%M:%S %z", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%d"):
-        try:
-            dt = datetime.strptime(s, fmt)
-            return dt.year
+            y = int(m.group(1)); seq = int(m.group(2))
         except Exception:
             continue
-    # last resort: if string contains 4-digit year anywhere, pick first
-    m2 = re.search(r"(\d{4})", s)
-    if m2:
+        if y == year and seq > max_seq:
+            max_seq = seq
+    return f"{META_ID_PREFIX}-{year}-{str(max_seq + 1).zfill(6)}"
+
+# ---------------- main function ----------------
+def sync_records_to_dynamodb_and_store_baseline(records: List[Dict], json_bytes: bytes, user_cfg: Dict) -> Dict:
+    """
+    records: list of normalized dicts (each must include 'module_key' and canonical fields)
+    json_bytes: canonical transformed JSON bytes (uploaded to S3 canonical key)
+    user_cfg: overrides for DEFAULT_CONFIG (must include S3_BUCKET)
+    """
+    cfg = _resolve_config(user_cfg)
+    s3_bucket = cfg["S3_BUCKET"]
+    s3_prefix = cfg["S3_PREFIX"]
+    baseline_key = f"{s3_prefix}{cfg['BASELINE_FILENAME']}"
+    canonical_key = f"{s3_prefix}{cfg['CANONICAL_FILENAME']}"
+
+    if not s3_bucket:
+        raise RuntimeError("S3_BUCKET must be set in config/env")
+
+    # boto3 clients
+    s3 = boto3.client(
+        "s3",
+        aws_access_key_id=cfg.get("AWS_ACCESS_KEY_ID"),
+        aws_secret_access_key=cfg.get("AWS_SECRET_ACCESS_KEY"),
+        region_name=cfg.get("AWS_REGION")
+    )
+    ddb = boto3.resource(
+        "dynamodb",
+        aws_access_key_id=cfg.get("AWS_ACCESS_KEY_ID"),
+        aws_secret_access_key=cfg.get("AWS_SECRET_ACCESS_KEY"),
+        region_name=cfg.get("AWS_REGION"),
+        endpoint_url=cfg.get("DDB_ENDPOINT")
+    )
+
+    # Upload canonical JSON to S3 (overwrite)
+    if json_bytes:
+        print(f"⬆️ Uploading transformed JSON to s3://{s3_bucket}/{canonical_key}")
+        _s3_put_bytes(s3, s3_bucket, canonical_key, json_bytes)
+        print("✅ Canonical JSON upload complete")
+
+    # Load baseline JSON from S3 (if exists)
+    print(f"🔁 Fetching baseline from s3://{s3_bucket}/{baseline_key}")
+    baseline_text = _s3_get_text_if_exists(s3, s3_bucket, baseline_key)
+    baseline_map = {}  # module_key -> baseline dict
+    if baseline_text:
         try:
-            return int(m2.group(1))
-        except Exception:
-            pass
-    return None
-
-# CVE extraction
-CVE_RE = re.compile(r"(CVE-\d{4}-\d{4,7})", re.IGNORECASE)
-def extract_cve(references_field):
-    """
-    Extract first CVE-like token from references (string like 'CVE-2007-4387;OSVDB-37667;...')
-    Returns e.g. 'CVE-2007-4387' or None.
-    """
-    if not references_field:
-        return None
-    s = str(references_field)
-    m = CVE_RE.search(s)
-    return m.group(1).upper() if m else None
-
-def scan_existing_ids_from_ddb(table):
-    """Scan DynamoDB table and return set of existing 'id' PKs."""
-    existing = set()
-    client = table.meta.client
-    paginator = client.get_paginator("scan")
-    try:
-        for page in paginator.paginate(TableName=table.name, ProjectionExpression="id"):
-            for it in page.get("Items", []):
-                if "id" in it:
-                    existing.add(it["id"])
-    except Exception:
-        # ignore scan errors; return whatever collected
-        pass
-    return existing
-
-# ---------- Main function ----------
-def sync_today_with_dynamodb(current_csv_path, config=None):
-    """
-    Sync CSV -> DynamoDB with config overrides.
-    - Generates unique META-{year}-{6digit} id for new rows using mod_time year.
-    - Uses that generated id as DynamoDB partition key (stored in attribute 'id').
-    - Stores original module key as 'module_id'.
-    - Adds 'cve_id' extracted from 'references'.
-    - Overwrites baseline CSV with merged results and removes dated CSVs.
-    """
-    cfg = _resolve_config(config)
-    TABLE_NAME = cfg["TABLE_NAME"]
-    DAILY_DIR = cfg["DAILY_DIR"]
-    BASELINE_FILE = cfg["BASELINE_FILE"]
-    BATCH_PROGRESS_INTERVAL = cfg["BATCH_PROGRESS_INTERVAL"]
-
-    ensure_daily_dir(DAILY_DIR)
-    ddb = connect_dynamodb(cfg)
-    table = create_table_if_missing(ddb, TABLE_NAME)
-
-    # load incoming CSV
-    df_new = pd.read_csv(current_csv_path, dtype=str)
-    new_count = len(df_new)
-    print(f"ℹ️ Incoming transformed rows: {new_count}")
-
-    # Validation
-    if "id" not in df_new.columns:
-        raise ValueError("Incoming CSV must contain an 'id' column (module key)")
-
-    # map module_key -> row dict for incoming
-    new_map = {}
-    for _, r in df_new.iterrows():
-        rid = r.get("id")
-        if pd.isna(rid) or str(rid).strip() == "":
-            continue
-        new_map[str(rid).strip()] = r.to_dict()
-
-    # load baseline (if exists) as module_key -> row dict
-    base_map = {}
-    baseline_exists = os.path.exists(BASELINE_FILE)
-    if baseline_exists:
-        df_base = pd.read_csv(BASELINE_FILE, dtype=str)
-        for _, r in df_base.iterrows():
-            mid = r.get("module_id") or r.get("moduleid") or r.get("id")
-            # If baseline was using generated id in 'id', ensure module_id column exists; we try multiple fallbacks
-            if pd.isna(mid) or str(mid).strip() == "":
-                # if module_id missing, try to use 'id' column as module_id (legacy)
-                mid = r.get("id")
-            if pd.isna(mid) or str(mid).strip() == "":
-                continue
-            base_map[str(mid).strip()] = r.to_dict()
-        print(f"ℹ️ Baseline found with {len(base_map)} rows")
+            baseline_list = json.loads(baseline_text)
+            for b in baseline_list:
+                mk = b.get("module_key")
+                if mk:
+                    baseline_map[str(mk)] = b
+            print(f"ℹ️ Baseline loaded with {len(baseline_map)} modules")
+        except Exception as e:
+            print(f"❌ Failed to parse baseline JSON from S3: {e}")
+            baseline_map = {}
     else:
         print("ℹ️ No baseline found (first run)")
 
-    # compute changed module ids (new modules or modules with changed content)
-    changed_module_keys = []
-    for module_key, new_row in new_map.items():
-        base_row = base_map.get(module_key)
-        if base_row is None:
-            changed_module_keys.append(module_key)
-        else:
-            if rows_differ(new_row, base_row):
-                changed_module_keys.append(module_key)
+    # Ensure DDB table exists (create if missing)
+    table_name = cfg["TABLE_NAME"]
+    existing_tables = ddb.meta.client.list_tables().get("TableNames", [])
+    if table_name not in existing_tables:
+        print(f"⚡ Creating DynamoDB table '{table_name}'...")
+        t = ddb.create_table(
+            TableName=table_name,
+            KeySchema=[{"AttributeName": "id", "KeyType": "HASH"}],
+            AttributeDefinitions=[{"AttributeName": "id", "AttributeType": "S"}],
+            ProvisionedThroughput={"ReadCapacityUnits": 5, "WriteCapacityUnits": 5}
+        )
+        t.meta.client.get_waiter("table_exists").wait(TableName=table_name)
+        print("✅ Table created.")
+    table = ddb.Table(table_name)
 
-    print(f"ℹ️ Total changed module keys to consider: {len(changed_module_keys)}")
+    # scan existing ids from DDB to avoid META id collisions
+    existing_generated_ids = set()
+    try:
+        paginator = table.meta.client.get_paginator("scan")
+        for page in paginator.paginate(TableName=table_name, ProjectionExpression="id"):
+            for it in page.get("Items", []):
+                if "id" in it:
+                    existing_generated_ids.add(it["id"])
+    except Exception:
+        # ignore scan errors (e.g., empty table)
+        pass
 
-    # collect existing generated ids (to avoid collisions)
-    existing_generated_ids = scan_existing_ids_from_ddb(table)
-    # also include generated ids that might exist in baseline (baseline rows may contain id field)
-    for v in base_map.values():
-        possible_id = v.get("id")
-        if possible_id:
-            existing_generated_ids.add(possible_id)
+    # canonical fields: determine from records (exclude generated fields)
+    if records:
+        sample = records[0]
+        excluded = {"id", "module_id", "uploaded_date", "cve_id", "content_hash"}
+        canonical_fields = [k for k in sample.keys() if k not in excluded]
+        # ensure 'module_key' is not included in hash (it identifies the record)
+        if "module_key" in canonical_fields:
+            canonical_fields.remove("module_key")
+    else:
+        canonical_fields = []
 
-    # prepare to_write: for every changed module, generate a unique META id for it (if not already in baseline)
-    to_write = []
-    # compute per-year next id sequences by inspecting existing_generated_ids
-    # we'll call next_meta_id_for_year(existing_generated_ids, year) when needed
-    for module_key in changed_module_keys:
-        csv_row = new_map.get(module_key) or base_map.get(module_key)
-        if csv_row is None:
+    # Build current_map (module_key -> record) and compute content_hash
+    current_map = {}
+    for rec in records:
+        mk = rec.get("module_key")
+        if not mk:
             continue
+        # compute content_hash (based on canonical_fields)
+        rec_hash = _compute_content_hash_for_record(rec, canonical_fields) if canonical_fields else ""
+        rec["content_hash"] = rec_hash
+        current_map[str(mk)] = rec
 
-        # attach cve_id (extract from references)
-        csv_row["cve_id"] = extract_cve(csv_row.get("references"))
+    # Determine changed keys by comparing content_hash (fast)
+    changed_keys = []
+    for mk, rec in current_map.items():
+        base = baseline_map.get(mk)
+        if base is None:
+            changed_keys.append(mk)
+            continue
+        base_hash = base.get("content_hash")
+        # if baseline doesn't have content_hash, compute it from baseline entry using same canonical_fields
+        if not base_hash:
+            base_hash = _compute_content_hash_for_record(base, canonical_fields) if canonical_fields else ""
+        if rec.get("content_hash") != base_hash:
+            changed_keys.append(mk)
 
-        # decide year: prefer mod_time -> uploaded_date -> current year
-        mod_time_val = csv_row.get("mod_time") or csv_row.get("mod_time".lower()) or csv_row.get("modtime")
+    # If baseline was empty (.e.g no baseline_map) treat as first run and write all
+    if not baseline_map:
+        changed_keys = list(current_map.keys())
+
+    print(f"ℹ️ Changed/new modules to write: {len(changed_keys)}")
+
+    # Prepare items to write: ensure id (reuse baseline id if present), compute cve_id
+    to_write = []
+    for mk in changed_keys:
+        rec = dict(current_map.get(mk) or {})
+        # cve extraction
+        rec["cve_id"] = _extract_cve(rec.get("references"))
+        # year (prefer uploaded_date)
+        ud = rec.get("uploaded_date")
         year = None
-        if mod_time_val:
-            year = extract_year_from_mod_time(mod_time_val)
-        if year is None:
-            uploaded_date = csv_row.get("uploaded_date")
-            if uploaded_date:
-                try:
-                    year = int(str(uploaded_date)[:4])
-                except Exception:
-                    year = None
+        if ud:
+            try:
+                year = int(str(ud)[:4])
+            except Exception:
+                year = None
         if year is None:
             year = int(time.strftime("%Y"))
-
-        # if baseline already contained a generated id for this module, reuse it
-        baseline_entry = base_map.get(module_key, {})
-        existing_id_for_module = baseline_entry.get("id")
-        if existing_id_for_module and existing_id_for_module in existing_generated_ids:
-            generated_id = existing_id_for_module
+        # reuse baseline id if present
+        baseline_entry = baseline_map.get(mk, {}) or {}
+        existing_id = baseline_entry.get("id")
+        if existing_id and existing_id in existing_generated_ids:
+            gen_id = existing_id
         else:
-            # generate a new unique META id for this year
-            generated_id = next_meta_id_for_year(existing_generated_ids, year)
-            existing_generated_ids.add(generated_id)
+            gen_id = _next_meta_id_for_year(existing_generated_ids, year)
+            existing_generated_ids.add(gen_id)
+        rec["id"] = gen_id
+        rec["module_id"] = mk
+        rec["content_hash"] = rec.get("content_hash")
+        rec["uploaded_date"] = rec.get("uploaded_date") or time.strftime("%Y-%m-%d")
+        to_write.append(rec)
 
-        # prepare item for DynamoDB
-        item = {}
-        for k, v in csv_row.items():
-            if pd.isna(v) or (isinstance(v, str) and v.strip() == ""):
-                item[k] = None
-            else:
-                item[k] = v
-        item["id"] = generated_id            # partition key in DynamoDB
-        item["module_id"] = module_key       # original module key
-        item["uploaded_date"] = item.get("uploaded_date") or time.strftime("%Y-%m-%d")
-        # ensure cve_id is present (may be None)
-        item["cve_id"] = item.get("cve_id")
-
-        # compare with existing item in DDB to avoid unnecessary writes
-        ddb_item = None
-        try:
-            resp = table.get_item(Key={"id": generated_id})
-            ddb_item = resp.get("Item")
-        except ClientError as e:
-            print(f"⚠️ Warning fetching id={generated_id} from DDB: {e}")
-            ddb_item = None
-
-        if ddb_item is None:
-            to_write.append(item)
-        else:
-            if rows_differ(item, ddb_item):
-                to_write.append(item)
-            else:
-                # already up-to-date
-                pass
-
-    # batch write to DynamoDB
-    uploaded_ids = []
+    # Batch write with safe conversion
+    uploaded = []
     if to_write:
-        print(f"⬆️ Writing {len(to_write)} item(s) to DynamoDB...")
-        with table.batch_writer(overwrite_by_pkeys=["id"]) as batch:
+        print(f"⬆️ Writing {len(to_write)} items to DynamoDB...")
+        with table.batch_writer() as batch:
             cnt = 0
             for item in to_write:
-                # convert floats to Decimal, handle NaN/inf, remove empty strings
                 safe_item = {}
                 for k, v in item.items():
-                    # convert float -> Decimal
-                    if isinstance(v, float):
-                        if math.isnan(v) or math.isinf(v):
-                            safe_item[k] = None
-                        else:
-                            try:
-                                safe_item[k] = Decimal(str(v))
-                            except (InvalidOperation, Exception):
-                                safe_item[k] = str(v)
-                    else:
-                        # convert "None-like" strings -> None
-                        if isinstance(v, str) and v.strip() == "":
-                            safe_item[k] = None
-                        else:
-                            safe_item[k] = v
+                    safe_item[k] = _normalize_for_ddb(v)
                 try:
                     batch.put_item(Item=safe_item)
-                    uploaded_ids.append(safe_item["id"])
-                except ClientError as e:
-                    print(f"❌ Failed to put item id={safe_item.get('id')}: {e}")
+                    uploaded.append(safe_item.get("id"))
+                except Exception as e:
+                    print(f"❌ Failed to write id={safe_item.get('id')}: {e}")
                 cnt += 1
-                if cnt % BATCH_PROGRESS_INTERVAL == 0 or cnt == len(to_write):
+                if cnt % cfg.get("BATCH_PROGRESS_INTERVAL", 100) == 0 or cnt == len(to_write):
                     print(f"⬆️ Batch wrote {cnt}/{len(to_write)}")
+        print(f"✅ Uploaded {len(uploaded)} items")
     else:
         print("ℹ️ Nothing to write to DynamoDB.")
 
-    # Persist baseline: merge base_map and new_map but store generated id and module_id
-    # Build merged_map keyed by module_key
-    merged_map = base_map.copy()
-    # For modules in new_map, update merged_map entries with latest CSV data
-    for module_key, csv_row in new_map.items():
-        merged_map[module_key] = csv_row.copy()
-
-    # Ensure each merged_map row has 'id' (generated id) and 'module_id' and cve_id
-    for module_key in merged_map.keys():
-        # if baseline already had generated id, keep; else, if we wrote a new item for this module, find it
-        baseline_entry = merged_map.get(module_key, {})
-        # if baseline_entry already has 'id' (generated) keep it
-        if baseline_entry.get("id"):
-            pass
-        else:
-            # try to find in to_write list the item with module_id == module_key
-            found = next((it for it in to_write if it.get("module_id") == module_key), None)
-            if found:
-                merged_map[module_key]["id"] = found.get("id")
-        # ensure module_id present
-        merged_map[module_key]["module_id"] = module_key
+    # Merge baseline_map and current_map; ensure content_hash included and baseline stores module_key
+    merged = baseline_map.copy()
+    for mk, rec in current_map.items():
+        # prefer baseline id if present
+        base_entry = baseline_map.get(mk, {}) or {}
+        merged_entry = dict(rec)  # contains content_hash
+        if not merged_entry.get("id") and base_entry.get("id"):
+            merged_entry["id"] = base_entry.get("id")
+        merged_entry["module_key"] = mk
         # ensure cve_id present
-        merged_map[module_key]["cve_id"] = merged_map[module_key].get("cve_id") or extract_cve(merged_map[module_key].get("references"))
-        # ensure uploaded_date
-        if not merged_map[module_key].get("uploaded_date"):
-            merged_map[module_key]["uploaded_date"] = time.strftime("%Y-%m-%d")
+        if not merged_entry.get("cve_id"):
+            merged_entry["cve_id"] = _extract_cve(merged_entry.get("references"))
+        merged[mk] = merged_entry
 
-    # Prepare baseline DataFrame and write (columns union)
-    all_cols = set()
-    for v in merged_map.values():
-        all_cols.update(v.keys())
-    # Make sure at least these columns exist
-    all_cols.update(["id", "module_id", "cve_id", "uploaded_date"])
-    baseline_rows = []
-    for module_key, row in merged_map.items():
-        r = row.copy()
-        r["id"] = r.get("id")  # may be None for never-uploaded modules
-        r["module_id"] = module_key
-        r["cve_id"] = r.get("cve_id")
-        r["uploaded_date"] = r.get("uploaded_date") or time.strftime("%Y-%m-%d")
-        baseline_rows.append(r)
+    baseline_list = list(merged.values())
+    baseline_bytes = json.dumps(baseline_list, ensure_ascii=False, indent=2).encode("utf-8")
 
-    df_baseline = pd.DataFrame(baseline_rows, columns=sorted(list(all_cols)))
-    try:
-        df_baseline.to_csv(BASELINE_FILE, index=False)
-        print(f"✅ Baseline CSV updated: {BASELINE_FILE}")
-    except Exception as e:
-        print(f"⚠️ Failed to update baseline CSV: {e}")
+    # Upload baseline to S3 (overwrite)
+    print(f"⬆️ Uploading baseline JSON to s3://{s3_bucket}/{baseline_key}")
+    _s3_put_bytes(s3, s3_bucket, baseline_key, baseline_bytes)
+    print("✅ Baseline upload complete")
 
-    # cleanup other dated CSV files
-    remove_dated_csvs_keep_baseline(DAILY_DIR, BASELINE_FILE)
-
-    result = {
-        "timestamp": time.strftime("%Y-%m-%d_%H%M%S"),
-        "total_incoming": new_count,
-        "changed_considered": len(changed_module_keys),
-        "to_write": len(to_write),
-        "uploaded": len(uploaded_ids),
-        "baseline_file": BASELINE_FILE
+    summary = {
+        "uploaded": len(uploaded),
+        "changed_keys": len(changed_keys),
+        "total_current": len(current_map),
+        "s3_canonical": f"s3://{s3_bucket}/{canonical_key}",
+        "s3_baseline": f"s3://{s3_bucket}/{baseline_key}"
     }
-    print("ℹ️ Sync result:", result)
-    return result
+    print("ℹ️ Sync summary:", summary)
+    return summary
